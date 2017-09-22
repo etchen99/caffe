@@ -1,5 +1,3 @@
-#include <Python.h>  // NOLINT(build/include_alpha)
-
 // Produce deprecation warnings (needs to come before arrayobject.h inclusion).
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 
@@ -39,6 +37,41 @@
   } \
 } while (0)
 
+#if defined(_MSC_VER) && (_MSC_FULL_VER >= 190024210)
+// Workaround for VS 2015 Update 3 which breaks boost python
+// See: http://stackoverflow.com/questions/38261530/unresolved-external-symbols-since-visual-studio-2015-update-3-boost-python-link
+// and https://msdn.microsoft.com/vs-knownissues/vs2015-update3
+#define BP_GET_POINTER(cls) \
+namespace boost { \
+template <> \
+const volatile caffe::cls * \
+get_pointer(const volatile caffe::cls *c) { \
+    return c; \
+} \
+}
+
+#define BP_GET_POINTER_T(cls, dtype) BP_GET_POINTER(cls<dtype>)
+
+// forward declare the NCCL class
+// in case we are not using NCCL
+namespace caffe {
+template <typename Dtype> class NCCL;
+}
+
+BP_GET_POINTER_T(Net, float);
+BP_GET_POINTER_T(Layer, float);
+BP_GET_POINTER_T(Solver, float);
+BP_GET_POINTER_T(SGDSolver, float);
+BP_GET_POINTER_T(NesterovSolver, float);
+BP_GET_POINTER_T(AdaGradSolver, float);
+BP_GET_POINTER_T(RMSPropSolver, float);
+BP_GET_POINTER_T(AdaDeltaSolver, float);
+BP_GET_POINTER_T(AdamSolver, float);
+BP_GET_POINTER_T(NCCL, float);
+BP_GET_POINTER(Timer);
+
+#endif
+
 namespace bp = boost::python;
 
 namespace caffe {
@@ -51,18 +84,18 @@ const int NPY_DTYPE = NPY_FLOAT32;
 void set_mode_cpu() { Caffe::set_mode(Caffe::CPU); }
 void set_mode_gpu() { Caffe::set_mode(Caffe::GPU); }
 
-void InitLog() {
+void InitLog(int level) {
+  FLAGS_logtostderr = 1;
+  FLAGS_minloglevel = level;
   ::google::InitGoogleLogging("");
+#ifndef _MSC_VER
+  // this symbol is undefined on windows
   ::google::InstallFailureSignalHandler();
+#endif  // _MSC_VER
 }
-void InitLogLevel(int level) {
-  FLAGS_minloglevel = level;
-  InitLog();
-}
-void InitLogLevelPipe(int level, bool stderr) {
-  FLAGS_minloglevel = level;
-  FLAGS_logtostderr = stderr;
-  InitLog();
+void InitLogInfo() {
+  // Windows disables abbreviated severities
+  InitLog(google::GLOG_INFO);
 }
 void Log(const string& s) {
   LOG(INFO) << s;
@@ -302,10 +335,6 @@ void Solver_add_nccl(Solver<Dtype>* solver
 #endif
 }
 
-void share_weights(Solver<Dtype>* solver, Net<Dtype>* net) {
-  net->ShareTrainedLayersWith(solver->net().get());
-}
-
 template<typename Dtype>
 class NetCallback: public Net<Dtype>::Callback {
  public:
@@ -347,35 +376,6 @@ class NCCL {
 };
 #endif
 
-bool HasNCCL() {
-#ifdef USE_NCCL
-  return true;
-#else
-  return false;
-#endif
-}
-
-#ifdef USE_NCCL
-bp::object NCCL_New_Uid() {
-  std::string uid = NCCL<Dtype>::new_uid();
-#if PY_MAJOR_VERSION >= 3
-  // Convert std::string to bytes so that Python does not
-  // try to decode the string using the current locale.
-
-  // Since boost 1.53 boost.python will convert str and bytes
-  // to std::string but will convert std::string to str. Here we
-  // force a bytes object to be returned. When this object
-  // is passed back to the NCCL constructor boost.python will
-  // correctly convert the bytes to std::string automatically
-  PyObject* py_uid = PyBytes_FromString(uid.c_str());
-  return bp::object(bp::handle<>(py_uid));
-#else
-  // automatic conversion is correct for python 2.
-  return bp::object(uid);
-#endif
-}
-#endif
-
 BOOST_PYTHON_MEMBER_FUNCTION_OVERLOADS(SolveOverloads, Solve, 0, 1);
 
 BOOST_PYTHON_MODULE(_caffe) {
@@ -386,10 +386,8 @@ BOOST_PYTHON_MODULE(_caffe) {
 
   // Caffe utility functions
   bp::def("init_log", &InitLog);
-  bp::def("init_log", &InitLogLevel);
-  bp::def("init_log", &InitLogLevelPipe);
+  bp::def("init_log", &InitLogInfo);
   bp::def("log", &Log);
-  bp::def("has_nccl", &HasNCCL);
   bp::def("set_mode_cpu", &set_mode_cpu);
   bp::def("set_mode_gpu", &set_mode_gpu);
   bp::def("set_random_seed", &set_random_seed);
@@ -464,14 +462,6 @@ BOOST_PYTHON_MODULE(_caffe) {
     .add_property("count",    static_cast<int (Blob<Dtype>::*)() const>(
         &Blob<Dtype>::count))
     .def("reshape",           bp::raw_function(&Blob_Reshape))
-#ifndef CPU_ONLY
-    .add_property("_gpu_data_ptr",
-        reinterpret_cast<uintptr_t (Blob<Dtype>::*)()>(
-          &Blob<Dtype>::mutable_gpu_data))
-    .add_property("_gpu_diff_ptr",
-        reinterpret_cast<uintptr_t (Blob<Dtype>::*)()>(
-          &Blob<Dtype>::mutable_gpu_diff))
-#endif
     .add_property("data",     bp::make_function(&Blob<Dtype>::mutable_cpu_data,
           NdarrayCallPolicies()))
     .add_property("diff",     bp::make_function(&Blob<Dtype>::mutable_cpu_diff,
@@ -506,7 +496,6 @@ BOOST_PYTHON_MODULE(_caffe) {
     .def("step", &Solver<Dtype>::Step)
     .def("restore", &Solver<Dtype>::Restore)
     .def("snapshot", &Solver<Dtype>::Snapshot)
-    .def("share_weights", &share_weights)
     .add_property("param", bp::make_function(&Solver<Dtype>::param,
               bp::return_value_policy<bp::copy_const_reference>()));
   BP_REGISTER_SHARED_PTR_TO_PYTHON(Solver<Dtype>);
@@ -556,7 +545,7 @@ BOOST_PYTHON_MODULE(_caffe) {
     boost::noncopyable>("NCCL",
                         bp::init<shared_ptr<Solver<Dtype> >, const string&>())
 #ifdef USE_NCCL
-    .def("new_uid", NCCL_New_Uid).staticmethod("new_uid")
+    .def("new_uid", &NCCL<Dtype>::new_uid).staticmethod("new_uid")
     .def("bcast", &NCCL<Dtype>::Broadcast)
 #endif
     /* NOLINT_NEXT_LINE(whitespace/semicolon) */
